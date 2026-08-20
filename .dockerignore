@@ -15,10 +15,13 @@ src/ossp_router/**
 !src/ossp_router/protocol.py
 !src/ossp_router/runtime.py
 !src/ossp_router/scoring.py
+!src/ossp_router/gbm_features.py
+!src/ossp_router/gbm_router.py
 !src/ossp_router/resources/
 src/ossp_router/resources/**
 !src/ossp_router/resources/__init__.py
 !src/ossp_router/resources/routing-policy.v1.json
+!src/ossp_router/resources/gbm-artifact.v1.json
 !baselines/
 baselines/**
 !baselines/feature_budget.py

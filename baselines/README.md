@@ -163,3 +163,37 @@ hash-regex baseline은 채점용 평가셋을 사용한 사전 검증에서 비�
 뿐 일반화 점수가 아닙니다. 공개 Dev는 회귀계수 학습에 합치지 않고 안전계수와
 예산 통과 여부를 정하는 데만 사용합니다. 학습 파일에는 전역 계수, 공개 파일
 해시와 집계값만 남습니다.
+
+## GBM 라우터 (제출 구현)
+
+`src/ossp_router/gbm_router.py`는 이 fork의 제출 라우터입니다. 추론은 표준
+라이브러리만 사용하며, 순서는 다음과 같습니다.
+
+1. `src/ossp_router/gbm_features.py`로 dense 34개 + signed hashing 256 bins
+   특징을 추출하고, k-means centroid에 기반한 클러스터 타깃 인코딩 6개
+   특징을 덧붙입니다.
+2. JSON artifact의 트리+선형 blend 앙상블로 모델별 uplift(Δscore, light
+   대비)와 log-cost를 예측합니다. log-cost에는 lognormal 보정 exp(σ²/2)와
+   OOF에서 학습한 uplift shrinkage(slope, intercept)를 적용합니다.
+3. 등급 예산(추정 light 총비용 × 배수 × 안전계수) 안에서 λ 이진탐색
+   (Lagrangian relaxation)과 greedy fill로 선택을 확정합니다.
+
+학습 산출물 `src/ossp_router/resources/gbm-artifact.v1.json`은 공개 Train
+1,760문항으로 학습하고 공개 Dev로 등급별 안전계수만 보정했습니다. 외부
+사전학습 모델이나 외부 데이터는 사용하지 않습니다. 재현 명령:
+
+```console
+python3 -m pip install lightgbm scikit-learn numpy
+
+PYTHONPATH=src:baselines python3 baselines/train_gbm.py \
+  --input data/materialized/train/inputs.json \
+  --outcomes data/train/outcomes.json \
+  --validation-input data/materialized/dev/inputs.json \
+  --validation-outcomes data/dev/outcomes.json \
+  --artifact src/ossp_router/resources/gbm-artifact.v1.json \
+  --report build/gbm/train-report.json
+```
+
+학습 의존성(LightGBM, scikit-learn, NumPy)은 학습에만 사용하며 제출
+이미지에는 포함하지 않습니다. 공개 Dev self-check 최종 점수는 0.6988
+(fast 0.6670 / balanced 0.6980 / premium 0.7420)입니다.
