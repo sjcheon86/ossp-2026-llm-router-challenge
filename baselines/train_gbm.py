@@ -36,10 +36,14 @@ from ossp_router.protocol import (
 )
 
 FOLDS = 5
-SAFETY_GRID = [round(0.80 + 0.0025 * i, 4) for i in range(81)]  # 0.80 .. 1.00
+SAFETY_GRID = [round(0.30 + 0.01 * i, 4) for i in range(76)]  # 0.30 .. 1.05
 PESSIMISM_GRID = (0.0, 0.3, 0.6, 1.0, 1.4)  # 선택 제약용 비관 계수 k (cost×e^{kσ})
-BUDGET_MARGIN = 0.99  # 보정 시 실제 비용 비율이 한도의 이 비율 이하이길 요구
-DEV_ADJUST_TARGET = 0.985  # Dev 재보정 시 목표 비용 비율 (한도 대비)
+# 안전계수는 "한 표본에서 예산을 지키는가"가 아니라 "평가셋을 다시 추출해도
+# 지키는가"로 고릅니다. 실현 비용비의 부트스트랩 상위 분위가 한도 안에 들어야
+# 합니다. 한 표본에 맞춰 한도에 붙이면 다른 표본에서 0점을 맞습니다.
+RATIO_QUANTILE = 99.0
+BUDGET_MARGIN = 0.99
+BOOTSTRAP_REPS = 2000
 
 
 def _outcome_cost(outcome: Outcome, policy: RoutingPolicy) -> float:
@@ -350,6 +354,33 @@ def _realized(
     return quality, ratio
 
 
+def _bootstrap_ratio(
+    selection: Sequence[str],
+    actual_scores: np.ndarray,
+    actual_costs: np.ndarray,
+    rng: np.random.Generator,
+) -> Tuple[float, float, float]:
+    """고정된 선택에 대해 평가셋 재추출 시 품질과 실현 비용비 분포를 냅니다.
+
+    반환: (품질, 비용비 중앙값, 비용비 상위 RATIO_QUANTILE 분위).
+    """
+
+    indices = np.fromiter(
+        (MODEL_IDS.index(model) for model in selection), dtype=np.int64
+    )
+    rows = np.arange(len(selection))
+    picked_cost = actual_costs[rows, indices]
+    light_cost = actual_costs[:, 0]
+    picked_score = actual_scores[rows, indices]
+    draws = rng.integers(0, len(selection), (BOOTSTRAP_REPS, len(selection)))
+    ratios = picked_cost[draws].sum(axis=1) / light_cost[draws].sum(axis=1)
+    return (
+        float(picked_score.mean()),
+        float(np.median(ratios)),
+        float(np.percentile(ratios, RATIO_QUANTILE)),
+    )
+
+
 def _calibrate_safety(
     pred_scores: Sequence[Mapping[str, float]],
     sel_costs: Sequence[Mapping[str, float]],
@@ -357,16 +388,13 @@ def _calibrate_safety(
     actual_scores: np.ndarray,
     actual_costs: np.ndarray,
     policy: RoutingPolicy,
-    fold_ids: np.ndarray,
     sigma: Mapping[str, float],
 ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Any]]:
     """Fold-robust safety: 각 fold를 독립 배치로 보고 전 fold에서 예산을
     지키는 (비관 계수, 안전계수) 조합 중 전체 품질이 가장 높은 값을 고릅니다."""
 
     n = len(pred_scores)
-    fold_indices = [
-        [i for i in range(n) if fold_ids[i] == fold] for fold in range(FOLDS)
-    ]
+    rng = np.random.default_rng(11)
     robust_variants = {
         k: [
             {
@@ -377,48 +405,39 @@ def _calibrate_safety(
         ]
         for k in PESSIMISM_GRID
     }
+    light_pred_total = sum(budget_costs[i][MODEL_IDS[0]] for i in range(n))
     ratios: Dict[str, float] = {}
     pessimism: Dict[str, float] = {}
     detail: Dict[str, Any] = {}
     for tier in TIERS:
         multiplier = float(policy.tiers[tier].budget_multiplier)
+        limit = multiplier * BUDGET_MARGIN
         best = None
         for k in PESSIMISM_GRID:
             robust_costs = robust_variants[k]
             for safety in SAFETY_GRID:
-                total_quality = 0.0
-                worst_ratio = 0.0
-                feasible = True
-                for indices in fold_indices:
-                    f_scores = [pred_scores[i] for i in indices]
-                    f_robust = [robust_costs[i] for i in indices]
-                    light_pred = sum(budget_costs[i][MODEL_IDS[0]] for i in indices)
-                    budget = light_pred * multiplier * safety
-                    selection = gbm.select_models(f_scores, f_robust, budget)
-                    quality, ratio = _realized(
-                        selection,
-                        actual_scores[indices],
-                        actual_costs[indices],
-                    )
-                    total_quality += quality * len(indices)
-                    worst_ratio = max(worst_ratio, ratio)
-                    if ratio > multiplier * BUDGET_MARGIN:
-                        feasible = False
-                        break
-                if not feasible:
+                budget = light_pred_total * multiplier * safety
+                selection = gbm.select_models(pred_scores, robust_costs, budget)
+                quality, median_ratio, tail_ratio = _bootstrap_ratio(
+                    selection, actual_scores, actual_costs, rng
+                )
+                if tail_ratio > limit:
                     continue
-                key = (total_quality / n, k, -safety)
+                key = (quality, k, -safety)
                 if best is None or key > best[0]:
-                    best = (key, safety, k, total_quality / n, worst_ratio)
+                    best = (key, safety, k, quality, median_ratio, tail_ratio)
         if best is None:
-            best = (None, SAFETY_GRID[0], PESSIMISM_GRID[-1], 0.0, 0.0)
+            # 어떤 조합도 상위 분위 기준을 못 지키면 all-light로 후퇴합니다.
+            # 비용비가 정확히 1.0이므로 모든 등급에서 예산 안입니다.
+            best = ((0.0, 0.0, 0.0), SAFETY_GRID[0], PESSIMISM_GRID[-1], 0.0, 1.0, 1.0)
         ratios[tier] = best[1]
         pessimism[tier] = best[2]
         detail[tier] = {
             "safety_ratio": best[1],
             "pessimism_k": best[2],
             "oof_quality": best[3],
-            "oof_worst_fold_ratio": best[4],
+            "oof_median_ratio": best[4],
+            f"oof_p{int(RATIO_QUANTILE)}_ratio": best[5],
         }
     return ratios, pessimism, detail
 
@@ -536,7 +555,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         oof_cal[:, j] = slope * oof[:, j] + intercept
         print(f"  uplift 보정 {model}: slope={slope:.3f} intercept={intercept:+.3f}")
 
-    fold_ids = np.arange(len(X)) % FOLDS
     pred_scores, pred_costs = _rows_from_matrix(
         oof_cal[:, :n_uplift], oof_cal[:, n_uplift:], log_cost_sigma
     )
@@ -559,11 +577,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         actual_scores,
         actual_costs,
         policy,
-        fold_ids,
         log_cost_sigma,
     )
     for tier in TIERS:
-        print(f"  {tier}: safety={safety[tier]} k={pessimism[tier]}  OOF quality={detail[tier]['oof_quality']:.4f}  worst-fold ratio={detail[tier]['oof_worst_fold_ratio']:.3f}")
+        d = detail[tier]
+        tail_key = f"oof_p{int(RATIO_QUANTILE)}_ratio"
+        print(
+            f"  {tier}: safety={safety[tier]} k={pessimism[tier]}"
+            f"  OOF quality={d['oof_quality']:.4f}"
+            f"  비용비 중앙={d['oof_median_ratio']:.3f}"
+            f" p{int(RATIO_QUANTILE)}={d[tail_key]:.3f}"
+        )
 
     print("트리 export 및 검증...", flush=True)
     artifact = {
@@ -615,44 +639,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for tier in TIERS:
             multiplier = float(policy.tiers[tier].budget_multiplier)
             robust_costs = gbm.selection_costs(artifact, rows, tier, p_costs)
-            # Dev에서 안전계수를 양방향 재보정합니다: 목표 사용률
-            # (DEV_ADJUST_TARGET)을 넘지 않는 가장 큰 안전계수를 찾습니다
-            # (baseline과 동일하게 Dev는 등급별 스칼라 보정에만 사용).
-            adjusted = None
-            best_key = None
-            for candidate in [round(0.80 + 0.0025 * i, 4) for i in range(121)]:
-                budget = light_total_pred * multiplier * candidate
-                selection_c = gbm.select_models(p_scores, robust_costs, budget)
-                quality_c, ratio_c = _realized(selection_c, v_scores, v_costs)
-                if ratio_c <= multiplier * DEV_ADJUST_TARGET:
-                    key = (quality_c, -candidate)
-                    if best_key is None or key > best_key:
-                        best_key = key
-                        adjusted, selection, quality, ratio = (
-                            candidate, selection_c, quality_c, ratio_c
-                        )
-            if adjusted is None:
-                adjusted = SAFETY_GRID[0]
+            # Dev는 한 방향 안전 장치로만 씁니다. Train OOF에서 고른
+            # 안전계수를 Dev 부트스트랩으로 다시 확인하고, 상위 분위가
+            # 한도를 넘으면 낮추기만 합니다. Dev 품질을 최대화하려고 계수를
+            # 올리면 그 한 표본에 과적합되어 다른 표본에서 0점을 맞습니다.
+            dev_rng = np.random.default_rng(23)
+            limit = multiplier * BUDGET_MARGIN
+            adjusted = safety[tier]
+            while True:
                 budget = light_total_pred * multiplier * adjusted
                 selection = gbm.select_models(p_scores, robust_costs, budget)
-                quality, ratio = _realized(selection, v_scores, v_costs)
+                quality, median_ratio, tail_ratio = _bootstrap_ratio(
+                    selection, v_scores, v_costs, dev_rng
+                )
+                if tail_ratio <= limit or adjusted <= SAFETY_GRID[0]:
+                    break
+                adjusted = round(adjusted - 0.01, 4)
+            ratio = median_ratio
             if adjusted != safety[tier]:
-                print(f"  [dev] {tier}: safety {safety[tier]} -> {adjusted} (재보정)")
+                print(
+                    f"  [dev] {tier}: safety {safety[tier]} -> {adjusted}"
+                    f" (dev p{int(RATIO_QUANTILE)} 초과로 하향)"
+                )
                 safety[tier] = adjusted
                 artifact["tier_safety_ratios"][tier] = adjusted
-            ok = ratio <= multiplier
+            ok = tail_ratio <= multiplier
             tier_score = quality if ok else 0.0
             weight = float(policy.tiers[tier].weight)
             weighted += tier_score * weight
             counts = {m: selection.count(m) for m in MODEL_IDS}
             report["validation"][tier] = {
                 "quality": quality,
-                "cost_ratio": ratio,
+                "cost_ratio_median": median_ratio,
+                f"cost_ratio_p{int(RATIO_QUANTILE)}": tail_ratio,
                 "within_budget": ok,
                 "safety_ratio": adjusted,
                 "model_counts": counts,
             }
-            print(f"  [dev] {tier}: quality={quality:.4f} ratio={ratio:.3f} {'OK' if ok else 'OVER!'} {counts}")
+            print(
+                f"  [dev] {tier}: quality={quality:.4f} 비용비 중앙={median_ratio:.3f}"
+                f" p{int(RATIO_QUANTILE)}={tail_ratio:.3f} (한도 {multiplier})"
+                f" {'OK' if ok else 'OVER!'} {counts}"
+            )
         report["validation"]["final_score"] = weighted
         print(f"  [dev] final(가중) = {weighted:.6f}")
 
