@@ -52,6 +52,13 @@ FAMILY_PRIOR_WEIGHT = 120.0  # family별 보정을 전역 쪽으로 축소하는
 # 평평하기 때문). 대신 "초과확률이 목표 이하인 가장 큰 안전계수"를 고르고,
 # 인접한 더 낮은 값도 같은 조건을 만족할 것을 요구해 우연한 점을 배제합니다.
 OVERRUN_TARGET = 0.015
+# 표본 변동(부트스트랩)만으로는 부족합니다. 공개 baseline 문서에 따르면
+# hash-regex baseline은 공개 Dev에서 Premium 비용 비율 3.985였으나 채점용
+# 평가셋에서 약 4.2로 나타나 한도 4.0을 넘겨 0점 처리되었습니다
+# (baselines/README.md). 즉 평가셋과 Dev 사이에 약 +5.4%의 계통 이동이
+# 실제로 관측되었습니다. 그 두 배를 여유로 요구합니다.
+OBSERVED_SHIFT = 0.054
+SYSTEMATIC_HEADROOM = 2 * OBSERVED_SHIFT
 
 
 def _outcome_cost(outcome: Outcome, policy: RoutingPolicy) -> float:
@@ -564,6 +571,16 @@ def _calibrate_safety(
                     selection, actual_scores, actual_costs, rng, eval_size,
                     multiplier,
                 )
+                # 계통 이동 여유: 전체 집합에서의 실현 비율이 한도보다
+                # 충분히 낮아야 합니다. 평가셋이 Dev보다 비싸게 나오는
+                # 경우(관측 +5.4%)를 흡수하기 위한 조건입니다.
+                columns = [MODEL_IDS.index(m) for m in selection]
+                full_ratio = (
+                    actual_costs[np.arange(len(selection)), columns].sum()
+                    / actual_costs[:, 0].sum()
+                )
+                if multiplier / full_ratio - 1.0 < SYSTEMATIC_HEADROOM:
+                    continue
                 # 목표는 명목 품질이 아니라 기대점수입니다. 예산을 초과한
                 # 등급은 0점이므로 품질 x 예산준수확률을 최대화해야 하고,
                 # 꼬리 제약만 두면 여전히 한도 경계에 붙습니다.
@@ -927,6 +944,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     selection_c, v_scores, v_costs, dev_rng,
                     args.risk_eval_size, multiplier,
                 )
+                cols_c = [MODEL_IDS.index(m) for m in selection_c]
+                full_c = (
+                    v_costs[np.arange(len(selection_c)), cols_c].sum()
+                    / v_costs[:, 0].sum()
+                )
+                if multiplier / full_c - 1.0 < SYSTEMATIC_HEADROOM:
+                    candidate = round(candidate - 0.01, 4)
+                    continue
                 if over_c > OVERRUN_TARGET:
                     candidate = round(candidate - 0.01, 4)
                     continue
