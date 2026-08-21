@@ -359,10 +359,12 @@ def _bootstrap_ratio(
     actual_scores: np.ndarray,
     actual_costs: np.ndarray,
     rng: np.random.Generator,
-) -> Tuple[float, float, float]:
+    eval_size: Optional[int] = None,
+    multiplier: Optional[float] = None,
+) -> Tuple[float, float, float, float]:
     """고정된 선택에 대해 평가셋 재추출 시 품질과 실현 비용비 분포를 냅니다.
 
-    반환: (품질, 비용비 중앙값, 비용비 상위 RATIO_QUANTILE 분위).
+    반환: (품질, 비용비 중앙값, 상위 RATIO_QUANTILE 분위, 예산 초과 확률).
     """
 
     indices = np.fromiter(
@@ -372,13 +374,74 @@ def _bootstrap_ratio(
     picked_cost = actual_costs[rows, indices]
     light_cost = actual_costs[:, 0]
     picked_score = actual_scores[rows, indices]
-    draws = rng.integers(0, len(selection), (BOOTSTRAP_REPS, len(selection)))
+    size = min(eval_size or len(selection), len(selection))
+    draws = rng.integers(0, len(selection), (BOOTSTRAP_REPS, size))
     ratios = picked_cost[draws].sum(axis=1) / light_cost[draws].sum(axis=1)
+    overrun = float((ratios > multiplier).mean()) if multiplier else 0.0
     return (
         float(picked_score.mean()),
         float(np.median(ratios)),
         float(np.percentile(ratios, RATIO_QUANTILE)),
+        overrun,
     )
+
+
+def _expected_score(
+    pred_scores: Sequence[Mapping[str, float]],
+    sel_costs: Sequence[Mapping[str, float]],
+    budget_costs: Sequence[Mapping[str, float]],
+    actual_scores: np.ndarray,
+    actual_costs: np.ndarray,
+    policy: RoutingPolicy,
+    safety: Mapping[str, float],
+    pessimism: Mapping[str, float],
+    sigma: Mapping[str, float],
+    eval_size: Optional[int] = None,
+    reps: int = 400,
+) -> Dict[str, Any]:
+    """등급별 기대점수(품질 x 예산준수확률)와 가중 합을 계산합니다.
+
+    평가 배치를 eval_size 크기로 다시 추출하며, 라우터가 매 배치에서 예산을
+    다시 계산하는 동작까지 재현합니다.
+    """
+
+    n = len(pred_scores)
+    size = min(eval_size or n, n)
+    rng = np.random.default_rng(101)
+    tiers: Dict[str, Any] = {}
+    final = 0.0
+    for tier in TIERS:
+        multiplier = float(policy.tiers[tier].budget_multiplier)
+        inflation = {
+            m: math.exp(pessimism[tier] * sigma.get(m, 0.0)) for m in MODEL_IDS
+        }
+        robust = [
+            {m: sel_costs[i][m] * inflation[m] for m in MODEL_IDS} for i in range(n)
+        ]
+        ratios, quals = [], []
+        for _ in range(reps):
+            idx = rng.integers(0, n, size)
+            light_pred = sum(budget_costs[i][MODEL_IDS[0]] for i in idx)
+            selection = gbm.select_models(
+                [pred_scores[i] for i in idx],
+                [robust[i] for i in idx],
+                light_pred * multiplier * safety[tier],
+            )
+            columns = [MODEL_IDS.index(model) for model in selection]
+            ratios.append(actual_costs[idx, columns].sum() / actual_costs[idx, 0].sum())
+            quals.append(actual_scores[idx, columns].mean())
+        ratios = np.asarray(ratios)
+        quality = float(np.mean(quals))
+        overrun = float((ratios > multiplier).mean())
+        expected = quality * (1.0 - overrun)
+        tiers[tier] = {
+            "expected": expected,
+            "quality": quality,
+            "overrun": overrun,
+            "median_ratio": float(np.median(ratios)),
+        }
+        final += float(policy.tiers[tier].weight) * expected
+    return {"tiers": tiers, "final": final, "eval_size": size}
 
 
 def _calibrate_safety(
@@ -389,6 +452,7 @@ def _calibrate_safety(
     actual_costs: np.ndarray,
     policy: RoutingPolicy,
     sigma: Mapping[str, float],
+    eval_size: Optional[int] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Any]]:
     """Fold-robust safety: 각 fold를 독립 배치로 보고 전 fold에서 예산을
     지키는 (비관 계수, 안전계수) 조합 중 전체 품질이 가장 높은 값을 고릅니다."""
@@ -418,18 +482,23 @@ def _calibrate_safety(
             for safety in SAFETY_GRID:
                 budget = light_pred_total * multiplier * safety
                 selection = gbm.select_models(pred_scores, robust_costs, budget)
-                quality, median_ratio, tail_ratio = _bootstrap_ratio(
-                    selection, actual_scores, actual_costs, rng
+                quality, median_ratio, tail_ratio, overrun = _bootstrap_ratio(
+                    selection, actual_scores, actual_costs, rng, eval_size,
+                    multiplier,
                 )
-                if tail_ratio > limit:
+                # 목표는 명목 품질이 아니라 기대점수입니다. 예산을 초과한
+                # 등급은 0점이므로 품질 x 예산준수확률을 최대화해야 하고,
+                # 꼬리 제약만 두면 여전히 한도 경계에 붙습니다.
+                expected = quality * (1.0 - overrun)
+                if tail_ratio > limit and overrun > 0.02:
                     continue
-                key = (quality, k, -safety)
+                key = (round(expected, 4), -safety)
                 if best is None or key > best[0]:
-                    best = (key, safety, k, quality, median_ratio, tail_ratio)
+                    best = (key, safety, k, quality, median_ratio, tail_ratio, expected, overrun)
         if best is None:
             # 어떤 조합도 상위 분위 기준을 못 지키면 all-light로 후퇴합니다.
             # 비용비가 정확히 1.0이므로 모든 등급에서 예산 안입니다.
-            best = ((0.0, 0.0, 0.0), SAFETY_GRID[0], PESSIMISM_GRID[-1], 0.0, 1.0, 1.0)
+            best = ((0.0, 0.0), SAFETY_GRID[0], PESSIMISM_GRID[-1], 0.0, 1.0, 1.0, 0.0, 0.0)
         ratios[tier] = best[1]
         pessimism[tier] = best[2]
         detail[tier] = {
@@ -438,6 +507,8 @@ def _calibrate_safety(
             "oof_quality": best[3],
             "oof_median_ratio": best[4],
             f"oof_p{int(RATIO_QUANTILE)}_ratio": best[5],
+            "oof_expected": best[6],
+            "oof_overrun": best[7],
         }
     return ratios, pessimism, detail
 
@@ -470,8 +541,14 @@ def _rows_from_matrix(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="GBM 라우터 학습")
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--outcomes", type=Path, required=True)
+    parser.add_argument("--input", type=Path, action="append", required=True)
+    parser.add_argument("--outcomes", type=Path, action="append", required=True)
+    parser.add_argument(
+        "--risk-eval-size",
+        type=int,
+        default=880,
+        help="안전계수 보정 시 가정하는 평가 배치 크기. 작을수록 보수적입니다.",
+    )
     parser.add_argument("--validation-input", type=Path)
     parser.add_argument("--validation-outcomes", type=Path)
     parser.add_argument("--artifact", type=Path, required=True)
@@ -488,11 +565,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     policy = load_policy(args.policy) if args.policy else load_bundled_policy()
-    inputs, actual_scores, actual_costs = _load_split(
-        args.input, args.outcomes, policy
-    )
-    print(f"train: {len(inputs.episodes)}문항, 특징 추출 중...", flush=True)
-    X = np.asarray(extract_matrix(inputs.episodes, args.hash_bins))
+    if len(args.input) != len(args.outcomes):
+        raise SystemExit("--input과 --outcomes 개수가 같아야 합니다.")
+    episodes = []
+    score_parts, cost_parts = [], []
+    for input_path, outcomes_path in zip(args.input, args.outcomes):
+        split_inputs, split_scores, split_costs = _load_split(
+            input_path, outcomes_path, policy
+        )
+        episodes.extend(split_inputs.episodes)
+        score_parts.append(split_scores)
+        cost_parts.append(split_costs)
+        print(f"  {input_path}: {len(split_inputs.episodes)}문항", flush=True)
+    actual_scores = np.vstack(score_parts)
+    actual_costs = np.vstack(cost_parts)
+    print(f"학습 합계 {len(episodes)}문항, 특징 추출 중...", flush=True)
+    X = np.asarray(extract_matrix(episodes, args.hash_bins))
     # score는 light 대비 uplift(Δ)를 직접 회귀합니다. 라우팅 선택은
     # 에피소드 내 모델 간 차이만 사용하므로 절대 score가 필요 없고,
     # 공통 난이도 노이즈가 상쇄되어 Δ 추정이 더 안정적입니다.
@@ -578,6 +666,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         actual_costs,
         policy,
         log_cost_sigma,
+        args.risk_eval_size,
     )
     for tier in TIERS:
         d = detail[tier]
@@ -588,6 +677,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"  비용비 중앙={d['oof_median_ratio']:.3f}"
             f" p{int(RATIO_QUANTILE)}={d[tail_key]:.3f}"
         )
+    # OOF 기대점수: 폴드 밖 예측으로 계산한 품질에 예산 초과 확률을 반영한
+    # 값입니다. 학습 데이터를 어디까지 쓰든 편향되지 않는 유일한 지표이므로
+    # 설정 비교는 이 값으로 합니다.
+    oof_expected = _expected_score(
+        pred_scores,
+        sel_costs,
+        pred_costs,
+        actual_scores,
+        actual_costs,
+        policy,
+        safety,
+        pessimism,
+        log_cost_sigma,
+        args.risk_eval_size,
+    )
+    for tier in TIERS:
+        row = oof_expected["tiers"][tier]
+        print(
+            f"  [OOF 기대] {tier}: 기대 {row['expected']:.4f}"
+            f" = 품질 {row['quality']:.4f} x 준수 {1 - row['overrun']:.3f}"
+        )
+    print(f"  [OOF 기대] 가중 최종 = {oof_expected['final']:.4f}")
 
     print("트리 export 및 검증...", flush=True)
     artifact = {
@@ -625,7 +736,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for j, model in enumerate(MODEL_IDS):
         artifact["log_cost_heads"][model] = heads[n_uplift + j]
 
-    report: Dict[str, Any] = {"train_oof": detail}
+    report: Dict[str, Any] = {"train_oof": detail, "oof_expected": oof_expected}
     if args.validation_input and args.validation_outcomes:
         vin, v_scores, v_costs = _load_split(
             args.validation_input, args.validation_outcomes, policy
@@ -645,25 +756,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # 올리면 그 한 표본에 과적합되어 다른 표본에서 0점을 맞습니다.
             dev_rng = np.random.default_rng(23)
             limit = multiplier * BUDGET_MARGIN
-            adjusted = safety[tier]
-            while True:
-                budget = light_total_pred * multiplier * adjusted
-                selection = gbm.select_models(p_scores, robust_costs, budget)
-                quality, median_ratio, tail_ratio = _bootstrap_ratio(
-                    selection, v_scores, v_costs, dev_rng
+            adjusted = None
+            best_dev = None
+            candidate = safety[tier]
+            while candidate >= SAFETY_GRID[0]:
+                budget = light_total_pred * multiplier * candidate
+                selection_c = gbm.select_models(p_scores, robust_costs, budget)
+                q_c, med_c, tail_c, over_c = _bootstrap_ratio(
+                    selection_c, v_scores, v_costs, dev_rng,
+                    args.risk_eval_size, multiplier,
                 )
-                if tail_ratio <= limit or adjusted <= SAFETY_GRID[0]:
-                    break
-                adjusted = round(adjusted - 0.01, 4)
-            ratio = median_ratio
+                key = (round(q_c * (1.0 - over_c), 4), -candidate)
+                if best_dev is None or key > best_dev:
+                    best_dev = key
+                    adjusted = candidate
+                    selection, quality = selection_c, q_c
+                    median_ratio, tail_ratio, overrun = med_c, tail_c, over_c
+                candidate = round(candidate - 0.01, 4)
             if adjusted != safety[tier]:
                 print(
                     f"  [dev] {tier}: safety {safety[tier]} -> {adjusted}"
-                    f" (dev p{int(RATIO_QUANTILE)} 초과로 하향)"
+                    f" (dev 기대점수 최대화로 하향)"
                 )
                 safety[tier] = adjusted
                 artifact["tier_safety_ratios"][tier] = adjusted
-            ok = tail_ratio <= multiplier
+            ok = overrun <= 0.02
             tier_score = quality if ok else 0.0
             weight = float(policy.tiers[tier].weight)
             weighted += tier_score * weight
