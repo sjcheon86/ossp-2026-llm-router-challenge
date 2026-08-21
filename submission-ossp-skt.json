@@ -2,7 +2,7 @@
   "schema_version": 1,
   "challenge_id": "ossp-2026-llm-router-challenge",
   "repository_url": "https://github.com/sjcheon86/ossp-2026-llm-router-challenge",
-  "commit_sha": "89b8809e32100019ce7c6944455b30fbcfb1cb2d",
-  "image_digest": "ghcr.io/sjcheon86/ossp-2026-llm-router-challenge@sha256:2fd6bfc80e3576a5b93485d181ebd329e78f930f75db93bb8ee0e4855a1ff743",
+  "commit_sha": "a9bb8e6bad395598d91acd3a1deddb5e716a0b4e",
+  "image_digest": "ghcr.io/sjcheon86/ossp-2026-llm-router-challenge@sha256:482934373a712f05f707193fcf6d5f43c16499a1edac0644c8526ded4ab039da",
   "primary_license": "Apache-2.0"
 }
