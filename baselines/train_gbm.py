@@ -59,6 +59,12 @@ OVERRUN_TARGET = 0.015
 # 실제로 관측되었습니다. 그 두 배를 여유로 요구합니다.
 OBSERVED_SHIFT = 0.054
 SYSTEMATIC_HEADROOM = 2 * OBSERVED_SHIFT
+# 표본 변동은 복원추출 부트스트랩으로 재면 안 됩니다. 비용이 소수 문항에
+# 집중돼 있어(premium 선택 비용의 상위 1개 문항이 14%) 같은 문항이 중복
+# 추출되면 꼬리가 과장됩니다. 같은 n에서 독립분할과 비교하면 복원추출의
+# 초과폭이 2.3~2.4배 컸습니다. 그래서 독립분할(n/2)로 재고, n이 두 배가
+# 될 때 초과폭이 절반 이하로 줄어드는 실측에 따라 0.5를 곱해 환산합니다.
+TAIL_SPLIT_SCALE = 0.5
 
 
 def _outcome_cost(outcome: Outcome, policy: RoutingPolicy) -> float:
@@ -514,6 +520,41 @@ def _expected_score(
     return {"tiers": tiers, "final": final, "eval_size": size}
 
 
+def _split_tail_excess(
+    pred_scores, robust_costs, budget_costs, actual_costs,
+    multiplier: float, safety: float, rng: np.random.Generator,
+    splits: int = 20,
+) -> float:
+    """독립 분할(n/2)로 실현 비용 비율의 상위 분위 초과폭을 추정합니다.
+
+    복원추출 부트스트랩은 고비용 문항 중복으로 꼬리를 2배 이상 과장하므로
+    사용하지 않습니다. n이 두 배가 될 때 초과폭이 절반 이하로 줄어드는
+    실측에 따라 TAIL_SPLIT_SCALE을 곱해 실제 평가셋 크기로 환산합니다.
+    """
+
+    n = len(pred_scores)
+    half = n // 2
+    ratios = []
+    for _ in range(splits):
+        perm = rng.permutation(n)
+        for start in (0, half):
+            index = perm[start : start + half]
+            light = sum(budget_costs[i][MODEL_IDS[0]] for i in index)
+            selection = gbm.select_models(
+                [pred_scores[i] for i in index],
+                [robust_costs[i] for i in index],
+                light * multiplier * safety,
+            )
+            columns = [MODEL_IDS.index(model) for model in selection]
+            ratios.append(
+                actual_costs[index, columns].sum() / actual_costs[index, 0].sum()
+            )
+    values = np.asarray(ratios)
+    return TAIL_SPLIT_SCALE * float(
+        np.percentile(values, RATIO_QUANTILE) - np.median(values)
+    )
+
+
 def _calibrate_safety(
     pred_scores: Sequence[Mapping[str, float]],
     sel_costs: Sequence[Mapping[str, float]],
@@ -571,21 +612,27 @@ def _calibrate_safety(
                     selection, actual_scores, actual_costs, rng, eval_size,
                     multiplier,
                 )
-                # 계통 이동 여유: 전체 집합에서의 실현 비율이 한도보다
-                # 충분히 낮아야 합니다. 평가셋이 Dev보다 비싸게 나오는
-                # 경우(관측 +5.4%)를 흡수하기 위한 조건입니다.
+                # 결합 리스크 상한: 계통 이동(관측 +5.4%의 2배)과 표본 변동
+                # (독립분할 p99 초과폭을 n=880로 환산)이 함께 일어나는
+                # 경우까지 흡수해야 합니다.
                 columns = [MODEL_IDS.index(m) for m in selection]
                 full_ratio = (
                     actual_costs[np.arange(len(selection)), columns].sum()
                     / actual_costs[:, 0].sum()
                 )
-                if multiplier / full_ratio - 1.0 < SYSTEMATIC_HEADROOM:
+                # 계통 이동만으로 이미 한도를 넘으면 꼬리 계산을 생략합니다.
+                shifted = full_ratio * (1 + SYSTEMATIC_HEADROOM)
+                if shifted > multiplier:
                     continue
-                # 목표는 명목 품질이 아니라 기대점수입니다. 예산을 초과한
-                # 등급은 0점이므로 품질 x 예산준수확률을 최대화해야 하고,
-                # 꼬리 제약만 두면 여전히 한도 경계에 붙습니다.
                 expected = quality * (1.0 - overrun)
-                if overrun > OVERRUN_TARGET:
+                # 이미 확보한 최선보다 품질이 낮으면 비싼 꼬리 계산을 생략
+                if best is not None and quality <= best[3]:
+                    continue
+                excess = _split_tail_excess(
+                    pred_scores, robust_costs, budget_costs,
+                    actual_costs, multiplier, safety, rng,
+                )
+                if shifted + excess > multiplier:
                     continue
                 # 같은 비관계수에서 더 큰 안전계수를 선호하되, 기대점수가
                 # 확실히 나은 쪽을 택합니다(0.002 이내는 동률로 보고 보수적
@@ -949,7 +996,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     v_costs[np.arange(len(selection_c)), cols_c].sum()
                     / v_costs[:, 0].sum()
                 )
-                if multiplier / full_c - 1.0 < SYSTEMATIC_HEADROOM:
+                excess_c = _split_tail_excess(
+                    p_scores, robust_costs, p_costs, v_costs,
+                    multiplier, candidate, dev_rng,
+                )
+                if full_c * (1 + SYSTEMATIC_HEADROOM) + excess_c > multiplier:
                     candidate = round(candidate - 0.01, 4)
                     continue
                 if over_c > OVERRUN_TARGET:
