@@ -22,8 +22,10 @@ from ossp_router import gbm_router as gbm
 from ossp_router.gbm_features import (
     DEFAULT_HASH_BINS,
     FEATURE_VERSION,
+    detect_family,
     extract_matrix,
 )
+from ossp_router.heuristic import episode_text
 from ossp_router.protocol import (
     MODEL_IDS,
     TIERS,
@@ -44,6 +46,12 @@ PESSIMISM_GRID = (0.0, 0.3, 0.6, 1.0, 1.4)  # 선택 제약용 비관 계수 k (
 RATIO_QUANTILE = 99.0
 BUDGET_MARGIN = 0.99
 BOOTSTRAP_REPS = 2000
+FAMILY_MIN_ITEMS = 80  # 이보다 작은 family는 전역 보정을 사용
+FAMILY_PRIOR_WEIGHT = 120.0  # family별 보정을 전역 쪽으로 축소하는 강도
+# 기대점수의 argmax는 부트스트랩 추출에 따라 흔들립니다(곡선이 정점 근처에서
+# 평평하기 때문). 대신 "초과확률이 목표 이하인 가장 큰 안전계수"를 고르고,
+# 인접한 더 낮은 값도 같은 조건을 만족할 것을 요구해 우연한 점을 배제합니다.
+OVERRUN_TARGET = 0.015
 
 
 def _outcome_cost(outcome: Outcome, policy: RoutingPolicy) -> float:
@@ -386,6 +394,47 @@ def _bootstrap_ratio(
     )
 
 
+def _train_spread_heads(
+    X_cv: np.ndarray,
+    X_final: np.ndarray,
+    residuals: np.ndarray,
+    params: Mapping[str, Any],
+) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    """log-cost 잔차 크기(E|r|)를 예측하는 head를 학습합니다.
+
+    문항별 비용 예측 불확실성을 추정해 선택 단계의 비관 보정을 문항 단위로
+    적용하기 위한 것입니다. 타깃은 log(|잔차| + eps)입니다.
+    """
+
+    import lightgbm as lgb
+
+    n, n_targets = residuals.shape
+    fold_ids = np.arange(n) % FOLDS
+    targets = np.log(np.abs(residuals) + 1e-3)
+    heads: List[Dict[str, Any]] = []
+    oof = np.zeros_like(targets)
+    for col in range(n_targets):
+        y = targets[:, col]
+        col_best = []
+        for fold in range(FOLDS):
+            valid = fold_ids == fold
+            model = lgb.LGBMRegressor(**params)
+            model.fit(
+                X_cv[~valid],
+                y[~valid],
+                eval_set=[(X_cv[valid], y[valid])],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
+            oof[valid, col] = model.predict(X_cv[valid])
+            col_best.append(model.best_iteration_ or params["n_estimators"])
+        final_params = dict(params)
+        final_params["n_estimators"] = max(30, int(np.median(col_best)))
+        final = lgb.LGBMRegressor(**final_params)
+        final.fit(X_final, y)
+        heads.append(_export_head(final.booster_, X_final))
+    return heads, oof
+
+
 def _expected_score(
     pred_scores: Sequence[Mapping[str, float]],
     sel_costs: Sequence[Mapping[str, float]],
@@ -398,6 +447,8 @@ def _expected_score(
     sigma: Mapping[str, float],
     eval_size: Optional[int] = None,
     reps: int = 400,
+    mean_log_cost: Optional[np.ndarray] = None,
+    item_sigma: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """등급별 기대점수(품질 x 예산준수확률)와 가중 합을 계산합니다.
 
@@ -412,12 +463,24 @@ def _expected_score(
     final = 0.0
     for tier in TIERS:
         multiplier = float(policy.tiers[tier].budget_multiplier)
-        inflation = {
-            m: math.exp(pessimism[tier] * sigma.get(m, 0.0)) for m in MODEL_IDS
-        }
-        robust = [
-            {m: sel_costs[i][m] * inflation[m] for m in MODEL_IDS} for i in range(n)
-        ]
+        if item_sigma is not None:
+            robust = [
+                {
+                    m: math.exp(
+                        mean_log_cost[i][j] + pessimism[tier] * item_sigma[i][j]
+                    )
+                    for j, m in enumerate(MODEL_IDS)
+                }
+                for i in range(n)
+            ]
+        else:
+            inflation = {
+                m: math.exp(pessimism[tier] * sigma.get(m, 0.0)) for m in MODEL_IDS
+            }
+            robust = [
+                {m: sel_costs[i][m] * inflation[m] for m in MODEL_IDS}
+                for i in range(n)
+            ]
         ratios, quals = [], []
         for _ in range(reps):
             idx = rng.integers(0, n, size)
@@ -453,22 +516,37 @@ def _calibrate_safety(
     policy: RoutingPolicy,
     sigma: Mapping[str, float],
     eval_size: Optional[int] = None,
+    mean_log_cost: Optional[np.ndarray] = None,
+    item_sigma: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Any]]:
     """Fold-robust safety: 각 fold를 독립 배치로 보고 전 fold에서 예산을
     지키는 (비관 계수, 안전계수) 조합 중 전체 품질이 가장 높은 값을 고릅니다."""
 
     n = len(pred_scores)
     rng = np.random.default_rng(11)
-    robust_variants = {
-        k: [
-            {
-                m: sel_costs[i][m] * math.exp(k * sigma.get(m, 0.0))
-                for m in MODEL_IDS
-            }
-            for i in range(n)
-        ]
-        for k in PESSIMISM_GRID
-    }
+    # 문항별 sigma가 있으면 exp(평균 + k*sigma_i)로 비관 보정합니다.
+    if item_sigma is not None:
+        robust_variants = {
+            k: [
+                {
+                    m: math.exp(mean_log_cost[i][j] + k * item_sigma[i][j])
+                    for j, m in enumerate(MODEL_IDS)
+                }
+                for i in range(n)
+            ]
+            for k in PESSIMISM_GRID
+        }
+    else:
+        robust_variants = {
+            k: [
+                {
+                    m: sel_costs[i][m] * math.exp(k * sigma.get(m, 0.0))
+                    for m in MODEL_IDS
+                }
+                for i in range(n)
+            ]
+            for k in PESSIMISM_GRID
+        }
     light_pred_total = sum(budget_costs[i][MODEL_IDS[0]] for i in range(n))
     ratios: Dict[str, float] = {}
     pessimism: Dict[str, float] = {}
@@ -490,9 +568,12 @@ def _calibrate_safety(
                 # 등급은 0점이므로 품질 x 예산준수확률을 최대화해야 하고,
                 # 꼬리 제약만 두면 여전히 한도 경계에 붙습니다.
                 expected = quality * (1.0 - overrun)
-                if tail_ratio > limit and overrun > 0.02:
+                if overrun > OVERRUN_TARGET:
                     continue
-                key = (round(expected, 4), -safety)
+                # 같은 비관계수에서 더 큰 안전계수를 선호하되, 기대점수가
+                # 확실히 나은 쪽을 택합니다(0.002 이내는 동률로 보고 보수적
+                # 선택을 유지).
+                key = (round(expected / 0.002), safety)
                 if best is None or key > best[0]:
                     best = (key, safety, k, quality, median_ratio, tail_ratio, expected, overrun)
         if best is None:
@@ -556,6 +637,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--hash-bins", type=int, default=DEFAULT_HASH_BINS)
     parser.add_argument("--clusters", type=int, default=32)
+    parser.add_argument(
+        "--family-calibration",
+        action="store_true",
+        help="family별 uplift 보정 사용. Dev 프론티어에서 -0.0065로 측정되어"
+        " 기본 비활성입니다(train OOF 노이즈에 과적합).",
+    )
     parser.add_argument("--cost-quantile", type=float, default=0.0)
     parser.add_argument("--num-leaves", type=int, default=15)
     parser.add_argument("--learning-rate", type=float, default=0.05)
@@ -623,6 +710,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     print(f"log-cost 잔차 σ: { {m: round(v, 3) for m, v in log_cost_sigma.items()} }")
 
+    # 이분산 비용 모델: 평균 log-cost head의 OOF 잔차로 문항별 오차 크기를
+    # 학습합니다. 선택 단계에서 exp(평균 + k*sigma_i)를 비용으로 사용해
+    # 예측이 불안정한 문항만 보수적으로 처리합니다.
+    print("문항별 비용 분산(이분산) head 학습...", flush=True)
+    cost_residuals = oof[:, n_uplift:] - targets[:, n_uplift:]
+    spread_heads, spread_oof = _train_spread_heads(
+        X_cv, X_final, cost_residuals, params
+    )
+    oof_sigma = np.minimum(3.0, np.exp(spread_oof) / 0.7978845608028654)
+    for j, model in enumerate(MODEL_IDS):
+        print(
+            f"    sigma[{model}] 중앙 {np.median(oof_sigma[:, j]):.3f}"
+            f" p90 {np.percentile(oof_sigma[:, j], 90):.3f}"
+            f" (전역 상수 {log_cost_sigma[model]:.3f})"
+        )
+
     quantile_heads = None
     if args.cost_quantile > 0:
         print(f"quantile(alpha={args.cost_quantile}) 비용 head 학습...", flush=True)
@@ -643,9 +746,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         oof_cal[:, j] = slope * oof[:, j] + intercept
         print(f"  uplift 보정 {model}: slope={slope:.3f} intercept={intercept:+.3f}")
 
+    # family별 uplift 보정: 어휘 특징이 통하는 문항군(other, math_synth)에서는
+    # slope가 1에 가깝고, 통하지 않거나 역상관인 군(mcq, rules)에서는 0으로
+    # 수렴해 그 family 평균으로 후퇴합니다. family 표본이 작으면 전역 보정
+    # 쪽으로 축소합니다(경험적 베이즈, tau=FAMILY_PRIOR_WEIGHT).
+    families = np.array([detect_family(episode_text(e)) for e in episodes])
+    by_family: Dict[str, Dict[str, List[float]]] = {}
+    for family in sorted(set(families)) if args.family_calibration else ():
+        mask = families == family
+        if mask.sum() < FAMILY_MIN_ITEMS:
+            continue
+        entry: Dict[str, List[float]] = {}
+        for j, model in enumerate(MODEL_IDS[1:]):
+            design = np.vstack([oof[mask, j], np.ones(int(mask.sum()))]).T
+            (slope_raw, intercept_raw), *_ = np.linalg.lstsq(
+                design, targets[mask, j], rcond=None
+            )
+            weight = mask.sum() / (mask.sum() + FAMILY_PRIOR_WEIGHT)
+            g_slope, g_intercept = uplift_calibration[model]
+            slope = weight * slope_raw + (1 - weight) * g_slope
+            intercept = weight * intercept_raw + (1 - weight) * g_intercept
+            slope = float(np.clip(slope, 0.0, 1.2))
+            entry[model] = [slope, float(intercept)]
+        by_family[family] = entry
+        summary = " ".join(
+            f"{m.split('-')[0]} slope={entry[m][0]:.2f}" for m in MODEL_IDS[1:]
+        )
+        print(f"  family 보정 {family:<13} n={int(mask.sum()):>4}  {summary}")
+
+    # family 보정을 OOF 예측에 적용해 보정/평가에 반영
+    for j, model in enumerate(MODEL_IDS[1:]):
+        for family, entry in by_family.items():
+            mask = families == family
+            slope, intercept = entry[model]
+            oof_cal[mask, j] = slope * oof[mask, j] + intercept
+
     pred_scores, pred_costs = _rows_from_matrix(
         oof_cal[:, :n_uplift], oof_cal[:, n_uplift:], log_cost_sigma
     )
+    # 평균 비용 예측을 문항별 sigma로 보정합니다 (라우터와 같은 규칙).
+    for i in range(len(X)):
+        for j, model in enumerate(MODEL_IDS):
+            base = math.exp(oof[i, n_uplift + j] + 0.5 * oof_sigma[i, j] ** 2)
+            pred_costs[i][model] = base
+        light = pred_costs[i][MODEL_IDS[0]]
+        pred_costs[i][MODEL_IDS[1]] = max(
+            pred_costs[i][MODEL_IDS[1]], light * (1 + 1e-12)
+        )
+        pred_costs[i][MODEL_IDS[2]] = max(
+            pred_costs[i][MODEL_IDS[2]], pred_costs[i][MODEL_IDS[1]] * (1 + 1e-12)
+        )
+
     # 선택 제약용 OOF 비용 (gbm.selection_costs와 같은 규칙).
     if quantile_heads is not None:
         sel_costs = []
@@ -667,6 +818,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         policy,
         log_cost_sigma,
         args.risk_eval_size,
+        oof[:, n_uplift:],
+        oof_sigma,
     )
     for tier in TIERS:
         d = detail[tier]
@@ -691,6 +844,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pessimism,
         log_cost_sigma,
         args.risk_eval_size,
+        400,
+        oof[:, n_uplift:],
+        oof_sigma,
     )
     for tier in TIERS:
         row = oof_expected["tiers"][tier]
@@ -726,6 +882,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
     }
     artifact["uplift_calibration"] = uplift_calibration
+    artifact["uplift_calibration_by_family"] = by_family
+    artifact["log_cost_spread_heads"] = {
+        m: spread_heads[j] for j, m in enumerate(MODEL_IDS)
+    }
+    artifact["selection_pessimism"] = {t: pessimism[t] for t in TIERS}
     if quantile_heads is not None:
         artifact["selection_cost_heads"] = {
             m: quantile_heads[j] for j, m in enumerate(MODEL_IDS)
@@ -766,7 +927,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     selection_c, v_scores, v_costs, dev_rng,
                     args.risk_eval_size, multiplier,
                 )
-                key = (round(q_c * (1.0 - over_c), 4), -candidate)
+                if over_c > OVERRUN_TARGET:
+                    candidate = round(candidate - 0.01, 4)
+                    continue
+                key = (round(q_c * (1.0 - over_c) / 0.002), candidate)
                 if best_dev is None or key > best_dev:
                     best_dev = key
                     adjusted = candidate
@@ -780,7 +944,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 safety[tier] = adjusted
                 artifact["tier_safety_ratios"][tier] = adjusted
-            ok = overrun <= 0.02
+            if adjusted is None:
+                # 어떤 후보도 초과 목표를 만족하지 못하면 all-light로 후퇴
+                adjusted = SAFETY_GRID[0]
+                selection = [MODEL_IDS[0]] * len(p_scores)
+                quality, median_ratio, tail_ratio, overrun = _bootstrap_ratio(
+                    selection, v_scores, v_costs, dev_rng,
+                    args.risk_eval_size, multiplier,
+                )
+            ok = overrun <= OVERRUN_TARGET
             tier_score = quality if ok else 0.0
             weight = float(policy.tiers[tier].weight)
             weighted += tier_score * weight

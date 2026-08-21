@@ -17,8 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .gbm_features import FEATURE_VERSION, extract_vector
-from .heuristic import write_submission_atomic
+from .gbm_features import FEATURE_VERSION, detect_family, extract_vector
+from .heuristic import episode_text, write_submission_atomic
 from .protocol import (
     MODEL_IDS,
     TIERS,
@@ -107,7 +107,9 @@ def augment_rows(
 
 
 def predict_heads(
-    artifact: Mapping[str, Any], rows: Sequence[Sequence[float]]
+    artifact: Mapping[str, Any],
+    rows: Sequence[Sequence[float]],
+    families: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     """Return per-episode {model: score} and {model: cost} predictions."""
 
@@ -116,29 +118,50 @@ def predict_heads(
     score_heads = artifact["score_heads"]
     cost_heads = artifact["log_cost_heads"]
     # log-cost의 잔차 분산 보정: L2로 학습한 log 예측을 exp만 하면 기대
-    # 비용을 계통적으로 과소평가하므로 exp(σ²/2)를 곱합니다.
+    # 비용을 계통적으로 과소평가하므로 exp(σ²/2)를 곱합니다. 문항별 분산
+    # head가 있으면 문항마다 σ를 추정해 적용하고, 없으면 모델별 상수를
+    # 사용합니다.
     sigma = artifact.get("log_cost_sigma", {})
+    spread_heads = artifact.get("log_cost_spread_heads")
     inflation = {
         model: math.exp(0.5 * float(sigma.get(model, 0.0)) ** 2)
         for model in MODEL_IDS
     }
     # OOF에서 학습한 uplift shrinkage (slope, intercept) 보정.
+    # family별 보정이 있으면 그것을 우선 적용합니다. 어휘 특징이 무의미한
+    # 문항군에서는 slope가 0에 수렴해 그 family의 평균 uplift로 후퇴하므로,
+    # 잘못된 순위를 신뢰해 예산을 낭비하는 일을 막습니다.
     calibration = artifact.get("uplift_calibration", {})
-    for row in rows:
+    by_family = artifact.get("uplift_calibration_by_family") or {}
+    for index, row in enumerate(rows):
+        family = families[index] if families is not None else None
+        family_calibration = by_family.get(family) if family else None
         # score head는 light 대비 uplift(Δscore)를 예측할 수 있으므로
         # [-1, 1]로 클립합니다. λ-선택은 에피소드 내 차이만 사용합니다.
         score_row = {}
         for model in MODEL_IDS:
             value = eval_ensemble(score_heads[model], row)
-            slope_intercept = calibration.get(model)
+            slope_intercept = None
+            if family_calibration is not None:
+                slope_intercept = family_calibration.get(model)
+            if slope_intercept is None:
+                slope_intercept = calibration.get(model)
             if slope_intercept:
                 value = slope_intercept[0] * value + slope_intercept[1]
             score_row[model] = min(1.0, max(-1.0, value))
-        cost_row = {
-            model: math.exp(eval_ensemble(cost_heads[model], row))
-            * inflation[model]
-            for model in MODEL_IDS
-        }
+        if spread_heads is None:
+            cost_row = {
+                model: math.exp(eval_ensemble(cost_heads[model], row))
+                * inflation[model]
+                for model in MODEL_IDS
+            }
+        else:
+            cost_row = {}
+            for model in MODEL_IDS:
+                deviation = item_sigma(spread_heads[model], row)
+                cost_row[model] = math.exp(
+                    eval_ensemble(cost_heads[model], row) + 0.5 * deviation**2
+                )
         light = cost_row[MODEL_IDS[0]]
         cost_row[MODEL_IDS[1]] = max(cost_row[MODEL_IDS[1]], light * (1.0 + 1e-12))
         cost_row[MODEL_IDS[2]] = max(
@@ -147,6 +170,19 @@ def predict_heads(
         scores.append(score_row)
         costs.append(cost_row)
     return scores, costs
+
+
+# 잔차 크기 head는 E|r|을 예측합니다. 정규분포에서 E|r| = sigma*sqrt(2/pi)
+# 이므로 표준편차로 되돌릴 때 이 상수로 나눕니다.
+_MEAN_ABS_TO_SIGMA = 0.7978845608028654
+_MAX_SIGMA = 3.0
+
+
+def item_sigma(head: Mapping[str, Any], row: Sequence[float]) -> float:
+    """문항별 log-cost 예측 오차의 표준편차 추정값을 반환합니다."""
+
+    mean_abs = math.exp(eval_ensemble(head, row))
+    return min(_MAX_SIGMA, mean_abs / _MEAN_ABS_TO_SIGMA)
 
 
 def selection_costs(
@@ -160,6 +196,30 @@ def selection_costs(
     quantile 비용 head가 있으면 per-item 상위 quantile 예측을 쓰고, 없으면
     mean 예측을 사용합니다. 그 위에 등급별 보정 계수(비관 계수)를 곱합니다.
     """
+
+    spread_heads = artifact.get("log_cost_spread_heads")
+    pessimism = (artifact.get("selection_pessimism") or {}).get(tier)
+    if spread_heads is not None and pessimism is not None:
+        # 문항별 예측 불확실성에 비례해 비용을 올려 잡습니다. 비용이 잘
+        # 예측되는 문항에는 공격적으로, 튀는 문항에는 보수적으로 예산을
+        # 씁니다. 모델별 상수 계수보다 예산을 효율적인 쪽으로 보냅니다.
+        mean_heads = artifact["log_cost_heads"]
+        result: List[Dict[str, float]] = []
+        for row in rows:
+            cost_row = {}
+            for model in MODEL_IDS:
+                deviation = item_sigma(spread_heads[model], row)
+                cost_row[model] = math.exp(
+                    eval_ensemble(mean_heads[model], row)
+                    + float(pessimism) * deviation
+                )
+            light = cost_row[MODEL_IDS[0]]
+            cost_row[MODEL_IDS[1]] = max(cost_row[MODEL_IDS[1]], light * (1.0 + 1e-12))
+            cost_row[MODEL_IDS[2]] = max(
+                cost_row[MODEL_IDS[2]], cost_row[MODEL_IDS[1]] * (1.0 + 1e-12)
+            )
+            result.append(cost_row)
+        return result
 
     quantile_heads = artifact.get("selection_cost_heads")
     if quantile_heads:
@@ -272,9 +332,11 @@ def route(
     if inputs.schema_version != policy.schema_version:
         raise ProtocolError("입력과 정책의 schema_version이 일치하지 않습니다.")
     hash_bins = int(artifact["hash_bins"])
+    texts = [episode_text(episode) for episode in inputs.episodes]
     rows = [extract_vector(episode, hash_bins) for episode in inputs.episodes]
     rows = augment_rows(artifact, rows)
-    scores, costs = predict_heads(artifact, rows)
+    families = [detect_family(text) for text in texts]
+    scores, costs = predict_heads(artifact, rows, families)
     light_total = sum(row[MODEL_IDS[0]] for row in costs)
     multiplier = float(policy.tiers[tier].budget_multiplier)
     safety = float(artifact["tier_safety_ratios"][tier])
